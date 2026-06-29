@@ -1,26 +1,16 @@
+#define _XOPEN_SOURCE 700
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include <errno.h>
-#include <fcntl.h>
+#include <ftw.h>
 #include <dlfcn.h>
 #include <getopt.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <limits.h>
-#include <sys/syscall.h>
-#include <sys/stat.h>
 #include "plugin_api.h"
-
-// Структура для системного вызова getdents64
-struct linux_dirent64 {
-    ino64_t        d_ino;
-    off64_t        d_off;
-    unsigned short d_reclen;
-    unsigned char  d_type;
-    char           d_name[];
-};
 
 typedef enum { OP_AND, OP_OR } LogicOp;
 
@@ -42,6 +32,7 @@ size_t plugins_count = 0;
 LogicOp global_op = OP_AND; 
 bool invert_result = false; 
 bool debug_mode = false;
+
 int *opt_to_plugin_map = NULL;
 
 void print_help(const char *prog_name) {
@@ -56,16 +47,21 @@ void print_help(const char *prog_name) {
     
     printf("Опции загруженных плагинов:\n");
     for (size_t i = 0; i < plugins_count; i++) {
-        printf("--- Плагин %s (%s, %s) ---\n", plugins[i].name, plugins[i].info.plugin_purpose, plugins[i].info.plugin_author);
+        printf("--- Плагин %s (%s, %s) ---\n", plugins[i].name, 
+               plugins[i].info.plugin_purpose, plugins[i].info.plugin_author);
         for (size_t j = 0; j < plugins[i].info.sup_opts_len; j++) {
-            printf("  --%s\t%s\n", plugins[i].info.sup_opts[j].opt.name, plugins[i].info.sup_opts[j].opt_descr);
+            printf("  --%s\t%s\n", plugins[i].info.sup_opts[j].opt.name, 
+                   plugins[i].info.sup_opts[j].opt_descr);
         }
     }
 }
 
 void load_plugins(const char *dir_path) {
     DIR *d = opendir(dir_path);
-    if (!d) return;
+    if (!d) {
+        if (debug_mode) fprintf(stderr, "[MAIN] Не удалось открыть папку плагинов: %s\n", dir_path);
+        return;
+    }
 
     struct dirent *dir;
     while ((dir = readdir(d)) != NULL) {
@@ -75,7 +71,10 @@ void load_plugins(const char *dir_path) {
             snprintf(path, sizeof(path), "%s/%s", dir_path, dir->d_name);
             
             void *handle = dlopen(path, RTLD_LAZY);
-            if (!handle) continue;
+            if (!handle) {
+                if (debug_mode) fprintf(stderr, "[MAIN] Ошибка загрузки %s: %s\n", path, dlerror());
+                continue;
+            }
 
             Plugin p = {0};
             p.handle = handle;
@@ -84,6 +83,7 @@ void load_plugins(const char *dir_path) {
             p.process_file = dlsym(handle, "plugin_process_file");
 
             if (!p.get_info || !p.process_file || p.get_info(&p.info) < 0) {
+                if (debug_mode) fprintf(stderr, "[MAIN] Неверный API в плагине %s\n", path);
                 dlclose(handle);
                 free(p.name);
                 continue;
@@ -95,13 +95,22 @@ void load_plugins(const char *dir_path) {
             
             plugins = realloc(plugins, (plugins_count + 1) * sizeof(Plugin));
             plugins[plugins_count++] = p;
+            if (debug_mode) fprintf(stderr, "[MAIN] Успешно загружен плагин: %s\n", p.name);
         }
     }
     closedir(d);
 }
 
-// Применение логики плагинов к одному файлу
-void process_single_file(const char *fpath) {
+int ftw_cb(const char *fpath, const struct stat *sb, int typeflag) {
+    (void)sb; 
+    
+    if (typeflag == FTW_DNR) {
+        if (debug_mode) fprintf(stderr, "[MAIN] Ошибка доступа к каталогу: %s\n", fpath);
+        return 0;
+    }
+    
+    if (typeflag != FTW_F) return 0; 
+
     bool final_res = (global_op == OP_AND) ? true : false;
     bool plugins_ran = false;
     bool plugin_error = false;
@@ -115,59 +124,22 @@ void process_single_file(const char *fpath) {
                 plugin_error = true;
                 break;
             }
+
             bool match = (res == 0); 
+
             if (global_op == OP_AND) final_res = final_res && match;
             else final_res = final_res || match;
         }
     }
 
-    if (!plugins_ran || plugin_error) return; 
+    if (!plugins_ran || plugin_error) return 0; 
+
     if (invert_result) final_res = !final_res; 
 
     if (final_res) {
         printf("%s\n", fpath);
     }
-}
-
-// Рекурсивный обход каталогов через open() и getdents64()
-void traverse_dir_recursive(const char *dir_path) {
-    int fd = open(dir_path, O_RDONLY | O_DIRECTORY);
-    if (fd == -1) {
-        if (debug_mode) fprintf(stderr, "[MAIN] Ошибка доступа к каталогу: %s\n", dir_path);
-        return;
-    }
-
-    char buf[4096];
-    while (1) {
-        long nread = syscall(SYS_getdents64, fd, buf, sizeof(buf));
-        if (nread == -1 || nread == 0) break;
-
-        for (long bpos = 0; bpos < nread;) {
-            struct linux_dirent64 *d = (struct linux_dirent64 *)(buf + bpos);
-            
-            if (strcmp(d->d_name, ".") != 0 && strcmp(d->d_name, "..") != 0) {
-                char full_path[PATH_MAX];
-                snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, d->d_name);
-                
-                unsigned char type = d->d_type;
-                if (type == DT_UNKNOWN) {
-                    struct stat st;
-                    if (lstat(full_path, &st) == 0) {
-                        if (S_ISDIR(st.st_mode)) type = DT_DIR;
-                        else if (S_ISREG(st.st_mode)) type = DT_REG;
-                    }
-                }
-
-                if (type == DT_DIR) {
-                    traverse_dir_recursive(full_path);
-                } else if (type == DT_REG) {
-                    process_single_file(full_path);
-                }
-            }
-            bpos += d->d_reclen;
-        }
-    }
-    close(fd);
+    return 0;
 }
 
 char* get_exe_dir() {
@@ -196,24 +168,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // Загружаем плагины 
     load_plugins(plugin_dir);
 
+    // Считаем общее количество опций
     size_t total_long_opts = 2; 
     for (size_t i = 0; i < plugins_count; i++) {
         total_long_opts += plugins[i].info.sup_opts_len;
     }
 
     struct option *long_opts = calloc(total_long_opts + 1, sizeof(struct option));
-    if (!long_opts) {
-        perror("calloc failed");
-        return EXIT_FAILURE;
-    }
     opt_to_plugin_map = calloc(total_long_opts + 1000, sizeof(int)); 
-    if (!opt_to_plugin_map) {
-        perror("calloc failed");
-        free(long_opts);
-        return EXIT_FAILURE;
-    }
 
     long_opts[0] = (struct option){"help", no_argument, 0, 'h'};
     long_opts[1] = (struct option){"version", no_argument, 0, 'v'};
@@ -221,6 +186,7 @@ int main(int argc, char *argv[]) {
     size_t opt_idx = 2;
     int current_val = 1000; 
 
+    // Заполняем массив long_opts
     for (size_t i = 0; i < plugins_count; i++) {
         for (size_t j = 0; j < plugins[i].info.sup_opts_len; j++) {
             struct option o = plugins[i].info.sup_opts[j].opt;
@@ -231,18 +197,16 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Единственный системный проход аргументов
     int opt;
     optind = 1;
     opterr = 1;
-    int longindex = 0;
     
-    while ((opt = getopt_long(argc, argv, "P:AONvh", long_opts, &longindex)) != -1) {
+    while ((opt = getopt_long(argc, argv, "P:AONvh", long_opts, NULL)) != -1) {
         if (opt == 'h') {
             print_help(argv[0]); 
             return 0;
         } else if (opt == 'v') {
-            printf("Версия: 2.0\nАхмедов Фазл, N3251\n");
+            printf("Версия: 2.0\nСвиржевский А.Д., N3252\n");
             return 0;
         } else if (opt == 'A') {
             global_op = OP_AND;
@@ -251,7 +215,7 @@ int main(int argc, char *argv[]) {
         } else if (opt == 'N') {
             invert_result = true;
         } else if (opt == 'P') {
-            // Уже обработано ручным циклом
+            // Уже обработано в ручном цикле выше
         } else if (opt >= 1000) {
             int p_idx = opt_to_plugin_map[opt - 1000];
             Plugin *p = &plugins[p_idx];
@@ -262,10 +226,9 @@ int main(int argc, char *argv[]) {
             }
             
             struct option active = {0};
-            active.name = long_opts[longindex].name; 
-            
-            active.has_arg = long_opts[longindex].has_arg; 
-            
+            int lo_idx = opt - 1000 + 2; 
+            active.name = long_opts[lo_idx].name; 
+            active.has_arg = long_opts[lo_idx].has_arg; 
             active.flag = (int *)optarg; 
             
             p->active_opts[p->active_opts_len++] = active;
@@ -274,6 +237,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // Определение каталога для поиска
     const char *target_dir = ".";
     if (optind < argc) {
         target_dir = argv[optind];
@@ -282,9 +246,12 @@ int main(int argc, char *argv[]) {
         return 0; 
     }
 
-    // Запуск рекурсивного обхода каталогов
-    traverse_dir_recursive(target_dir);
+    // Обход файлов
+    if (ftw(target_dir, ftw_cb, 20) == -1) {
+        perror("ftw");
+    }
 
+    // Очистка памяти
     for (size_t i = 0; i < plugins_count; i++) {
         free(plugins[i].name);
         free(plugins[i].active_opts);
